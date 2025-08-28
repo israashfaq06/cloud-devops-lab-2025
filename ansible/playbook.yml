@@ -1,0 +1,188 @@
+---
+# playbook.yml
+# Purpose: Bootstrap python (if missing), install Docker Engine and Docker Compose (plugin),
+# start+enable services, add connecting user to docker group, install fail2ban, configure user access.
+# Works for Ubuntu/Debian (primary) and has a RedHat-family branch.
+
+- name: Bootstrap - ensure Python3 present for Ansible
+  hosts: app
+  gather_facts: no
+  become: no
+  tasks:
+    - name: Ensure python3 is present (Debian/Ubuntu)
+      raw: |
+        if ! command -v python3 >/dev/null 2>&1; then
+          sudo apt-get update -y || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-apt || true
+        fi
+
+    - name: Ensure python3 is present (RHEL/CentOS/AmazonLinux) (no-op if not applicable)
+      raw: |
+        if ! command -v python3 >/dev/null 2>&1; then
+          if command -v yum >/dev/null 2>&1; then
+            sudo yum install -y python3 || true
+          elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y python3 || true
+          fi
+        fi
+
+- name: Configure EC2 instances (install docker, compose plugin, fail2ban, user access)
+  hosts: app
+  gather_facts: yes
+  become: yes
+
+  vars:
+    docker_apt_packages:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    docker_debian_pkgs:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    docker_redhat_pkgs:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+
+  tasks:
+    - name: Ensure basic tools present (Debian-family)
+      apt:
+        name: "{{ docker_apt_packages }}"
+        state: present
+        update_cache: yes
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Add Docker GPG key (Debian)
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Add Docker apt repository (Debian)
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_facts['lsb']['codename'] }} stable"
+        state: present
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Install Docker Engine + Compose plugin (Debian)
+      apt:
+        name: "{{ docker_debian_pkgs }}"
+        state: latest
+        update_cache: yes
+      when: ansible_facts['os_family'] == 'Debian'
+      notify:
+        - restart docker
+
+    - name: Ensure basic tools present (RedHat-family)
+      yum:
+        name:
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+        state: present
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Add Docker repo (RedHat-family)
+      yum_repository:
+        name: docker-ce
+        description: Docker CE Stable - $basearch
+        baseurl: "https://download.docker.com/linux/centos/7/$basearch/stable"
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: yes
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Install Docker Engine + Compose plugin (RedHat)
+      yum:
+        name: "{{ docker_redhat_pkgs }}"
+        state: latest
+      when: ansible_facts['os_family'] == 'RedHat'
+      notify:
+        - restart docker
+
+    - name: Ensure docker service is enabled and started
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add connecting user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: Install Fail2Ban (Debian)
+      apt:
+        name: fail2ban
+        state: present
+        update_cache: yes
+      when: ansible_facts['os_family'] == 'Debian'
+      notify:
+        - restart fail2ban
+
+    - name: Install Fail2Ban (RedHat)
+      yum:
+        name: fail2ban
+        state: present
+      when: ansible_facts['os_family'] == 'RedHat'
+      notify:
+        - restart fail2ban
+
+    - name: Ensure SSH jail file for fail2ban (if present)
+      copy:
+        dest: /etc/fail2ban/jail.d/ssh.conf
+        content: |
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = /var/log/auth.log
+          maxretry = 5
+      when: ansible_facts['os_family'] == 'Debian'
+      notify:
+        - restart fail2ban
+
+    - name: Ensure devops user exists
+      user:
+        name: devops
+        groups: sudo
+        shell: /bin/bash
+        state: present
+        create_home: yes
+
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+      notify:
+        - restart ssh
+        - restart ssh (RedHat)
+
+  handlers:
+    - name: restart docker
+      service:
+        name: docker
+        state: restarted
+
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: restart ssh (RedHat)
+      service:
+        name: sshd
+        state: restarted
+      when: ansible_facts['os_family'] == 'RedHat'
